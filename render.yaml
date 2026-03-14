@@ -1,0 +1,34 @@
+services:
+  # ── Backend: Node.js/Express API + Socket.io ──────────────────────────────
+  - type: web
+    name: bidmaster-server
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: MONGO_URI
+        sync: false        # Set this secret in the Render dashboard
+      - key: JWT_SECRET
+        sync: false        # Set this secret in the Render dashboard
+      - key: GROQ_API_KEY
+        sync: false        # Set this secret in the Render dashboard
+
+  # ── Frontend: React + Vite (Static Site) ─────────────────────────────────
+  - type: web
+    name: bidmaster-client
+    runtime: static
+    rootDir: client
+    buildCommand: npm install --legacy-peer-deps && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false        # Set to your backend Render URL, e.g. https://bidmaster-server.onrender.com/api
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html   # Required for React Router SPA
