@@ -1,0 +1,820 @@
+================================================================
+  SECURE ONLINE BIDDING & WINNER DETERMINATION SYSTEM
+  BidMaster – Source Code Documentation
+  Stack: Node.js · Express · MongoDB · React (Vite) · Socket.io
+================================================================
+
+PROJECT STRUCTURE
+─────────────────
+Project/
+├── docker-compose.yml
+├── server/
+│   ├── server.js          config/ db.js
+│   ├── models/            User.js  Auction.js  Bid.js
+│   ├── controllers/       authController.js  auctionController.js
+│   │                      bidController.js   aiController.js
+│   ├── middleware/        authMiddleware.js  errorMiddleware.js
+│   ├── routes/            authRoute.js  auctionRoute.js
+│   │                      bidRoute.js   aiRoute.js
+│   └── services/          socketService.js  aiService.js
+└── client/src/
+    ├── App.jsx  main.jsx  index.css
+    ├── components/  Navbar.jsx  AuctionCard.jsx
+    ├── pages/       Home.jsx  Login.jsx  Register.jsx
+    │                Dashboard.jsx  AuctionView.jsx  AdminDashboard.jsx
+    ├── store/       useAuthStore.js  useAuctionStore.js
+    └── services/    api.js  socket.js
+
+================================================================
+FILE: server/server.js
+================================================================
+import express from 'express';
+import dotenv from 'dotenv';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import morgan from 'morgan';
+import http from 'http';
+import connectDB from './config/db.js';
+import { initSocket } from './services/socketService.js';
+import { errorHandler, notFound } from './middleware/errorMiddleware.js';
+import authRoutes    from './routes/authRoute.js';
+import auctionRoutes from './routes/auctionRoute.js';
+import bidRoutes     from './routes/bidRoute.js';
+import aiRoutes      from './routes/aiRoute.js';
+
+dotenv.config();
+connectDB();
+const app = express();
+app.use(helmet());
+app.use(cors({ origin: '*' }));
+app.use(express.json());
+app.use(morgan('dev'));
+app.use('/api/', rateLimit({ windowMs: 15*60*1000, max: 100 }));
+app.use('/api/auth',     authRoutes);
+app.use('/api/auctions', auctionRoutes);
+app.use('/api/bids',     bidRoutes);
+app.use('/api/ai',       aiRoutes);
+app.use(notFound);
+app.use(errorHandler);
+const server = http.createServer(app);
+initSocket(server);
+server.listen(process.env.PORT || 5000, () =>
+  console.log(`Server running on port ${process.env.PORT || 5000}`));
+
+================================================================
+FILE: server/config/db.js
+================================================================
+import mongoose from 'mongoose';
+import dns from 'dns';
+dns.setServers(['8.8.8.8', '8.8.4.4']);
+const connectDB = async () => {
+  try {
+    const conn = await mongoose.connect(process.env.MONGO_URI);
+    console.log(`MongoDB Connected: ${conn.connection.host}`);
+  } catch (error) { console.error(error.message); process.exit(1); }
+};
+export default connectDB;
+
+================================================================
+FILE: server/models/User.js
+================================================================
+import mongoose from 'mongoose';
+const userSchema = new mongoose.Schema({
+  name:     { type: String, required: true },
+  email:    { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  role:     { type: String, enum: ['User','Admin'], default: 'User' },
+}, { timestamps: true });
+export default mongoose.model('User', userSchema);
+
+================================================================
+FILE: server/models/Auction.js
+================================================================
+import mongoose from 'mongoose';
+const auctionSchema = new mongoose.Schema({
+  title:         { type: String, required: true },
+  description:   { type: String, required: true },
+  image:         { type: String, default: '' },
+  startingPrice: { type: Number, required: true },
+  currentBid:    { type: Number, default: 0 },
+  startTime:     { type: Date,   required: true },
+  endTime:       { type: Date,   required: true },
+  createdBy:     { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  winner:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  status:        { type: String, enum: ['upcoming','active','ended'], default: 'upcoming' },
+}, { timestamps: true });
+export default mongoose.model('Auction', auctionSchema);
+
+================================================================
+FILE: server/models/Bid.js
+================================================================
+import mongoose from 'mongoose';
+const bidSchema = new mongoose.Schema({
+  auction: { type: mongoose.Schema.Types.ObjectId, ref: 'Auction', required: true },
+  user:    { type: mongoose.Schema.Types.ObjectId, ref: 'User',    required: true },
+  amount:  { type: Number, required: true },
+}, { timestamps: true });
+export default mongoose.model('Bid', bidSchema);
+
+================================================================
+FILE: server/controllers/authController.js
+================================================================
+import User from '../models/User.js';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+
+const generateToken = (id, role) =>
+  jwt.sign({ id, role }, process.env.JWT_SECRET, { expiresIn: '30d' });
+
+export const registerUser = async (req, res) => {
+  try {
+    const { name, email, password, role } = req.body;
+    if (await User.findOne({ email }))
+      return res.status(400).json({ message: 'User already exists' });
+    const hashed = await bcrypt.hash(password, await bcrypt.genSalt(10));
+    const user = await User.create({ name, email, password: hashed, role: role||'User' });
+    res.status(201).json({ _id:user._id, name:user.name, email:user.email,
+      role:user.role, token: generateToken(user._id, user.role) });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+
+export const loginUser = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
+    if (user && await bcrypt.compare(password, user.password))
+      return res.json({ _id:user._id, name:user.name, email:user.email,
+        role:user.role, token: generateToken(user._id, user.role) });
+    res.status(401).json({ message: 'Invalid email or password' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+
+================================================================
+FILE: server/controllers/auctionController.js
+================================================================
+import Auction from '../models/Auction.js';
+import Bid     from '../models/Bid.js';
+import User    from '../models/User.js';
+import { getIO } from '../services/socketService.js';
+
+export const getAuctions = async (req, res) => {
+  try { res.json(await Auction.find({}).populate('createdBy','name email').sort({createdAt:-1})); }
+  catch (e) { res.status(500).json({ message: e.message }); }
+};
+export const getAuctionById = async (req, res) => {
+  try {
+    const a = await Auction.findById(req.params.id)
+      .populate('createdBy','name email').populate('winner','name');
+    a ? res.json(a) : res.status(404).json({ message:'Auction not found' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+export const createAuction = async (req, res) => {
+  try {
+    const { title,description,image,startingPrice,startTime,endTime } = req.body;
+    const a = await new Auction({ title,description,image,startingPrice,
+      currentBid:startingPrice, startTime,endTime, createdBy:req.user._id,
+      status:'active' }).save();
+    res.status(201).json(a);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+export const updateAuctionStatus = async (req, res) => {
+  try {
+    const a = await Auction.findById(req.params.id);
+    if (!a) return res.status(404).json({ message:'Auction not found' });
+    a.status = req.body.status;
+    await a.save();
+    getIO().to(req.params.id).emit('auction_status_changed',{auctionId:req.params.id,status:a.status});
+    res.json(a);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+export const deleteAuction = async (req, res) => {
+  try {
+    if (!await Auction.findById(req.params.id))
+      return res.status(404).json({ message:'Auction not found' });
+    await Bid.deleteMany({ auction: req.params.id });
+    await Auction.findByIdAndDelete(req.params.id);
+    getIO().emit('auction_deleted', { auctionId: req.params.id });
+    res.json({ message: 'Auction and all bids deleted' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+export const getAdminBidsByAuction = async (req, res) => {
+  try {
+    res.json(await Bid.find({auction:req.params.auctionId})
+      .populate('user','name email').sort({amount:-1}));
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+export const deleteBid = async (req, res) => {
+  try {
+    const bid = await Bid.findById(req.params.bidId);
+    if (!bid) return res.status(404).json({ message:'Bid not found' });
+    const auction = await Auction.findById(bid.auction);
+    await Bid.findByIdAndDelete(req.params.bidId);
+    if (auction) {
+      const top = await Bid.findOne({auction:auction._id}).sort({amount:-1});
+      auction.currentBid = top ? top.amount : auction.startingPrice;
+      await auction.save();
+      getIO().to(auction._id.toString())
+        .emit('bid_removed',{auctionId:auction._id, currentBid:auction.currentBid});
+    }
+    res.json({ message: 'Bid removed' });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+export const getAllUsers = async (req, res) => {
+  try { res.json(await User.find({}).select('-password').sort({createdAt:-1})); }
+  catch (e) { res.status(500).json({ message: e.message }); }
+};
+
+================================================================
+FILE: server/controllers/bidController.js
+================================================================
+import Bid     from '../models/Bid.js';
+import Auction from '../models/Auction.js';
+import { getIO } from '../services/socketService.js';
+
+export const createBid = async (req, res) => {
+  try {
+    const { auctionId, amount } = req.body;
+    const auction = await Auction.findById(auctionId);
+    if (!auction) return res.status(404).json({ message:'Auction not found' });
+    if (amount <= auction.currentBid)
+      return res.status(400).json({ message:'Bid must exceed current bid' });
+    const bid = await Bid.create({ auction:auctionId, user:req.user._id, amount });
+    auction.currentBid = amount;
+    await auction.save();
+    const populated = await Bid.findById(bid._id).populate('user','name');
+    getIO().to(auctionId).emit('new_bid',{ auctionId, currentBid:amount, bid:populated });
+    res.status(201).json(populated);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+export const getBidsByAuctionId = async (req, res) => {
+  try {
+    res.json(await Bid.find({auction:req.params.auctionId})
+      .populate('user','name').sort({createdAt:-1}));
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+
+================================================================
+FILE: server/controllers/aiController.js
+================================================================
+import { generateAuctionDescription } from '../services/aiService.js';
+export const generateDescription = async (req, res) => {
+  try {
+    const { title, keywords } = req.body;
+    if (!title) return res.status(400).json({ message:'Title is required' });
+    const description = await generateAuctionDescription(title, keywords||'');
+    res.json({ description });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+};
+
+================================================================
+FILE: server/middleware/authMiddleware.js
+================================================================
+import jwt  from 'jsonwebtoken';
+import User from '../models/User.js';
+export const protect = async (req, res, next) => {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer'))
+    return res.status(401).json({ message:'Not authorized, no token' });
+  try {
+    const decoded = jwt.verify(auth.split(' ')[1], process.env.JWT_SECRET);
+    req.user = await User.findById(decoded.id).select('-password');
+    next();
+  } catch { res.status(401).json({ message:'Not authorized, token failed' }); }
+};
+export const admin = (req, res, next) =>
+  req.user?.role === 'Admin' ? next()
+    : res.status(401).json({ message:'Not authorized as admin' });
+
+================================================================
+FILE: server/middleware/errorMiddleware.js
+================================================================
+export const errorHandler = (err, req, res, next) => {
+  const code = res.statusCode === 200 ? 500 : res.statusCode;
+  res.status(code).json({ message: err.message,
+    stack: process.env.NODE_ENV === 'production' ? null : err.stack });
+};
+export const notFound = (req, res, next) => {
+  next(Object.assign(new Error(`Not Found - ${req.originalUrl}`), { status: 404 }));
+};
+
+================================================================
+FILE: server/services/socketService.js
+================================================================
+import { Server } from 'socket.io';
+let io;
+export const initSocket = (server) => {
+  io = new Server(server, { cors: { origin:'*', methods:['GET','POST'] } });
+  io.on('connection', socket => {
+    console.log(`Connected: ${socket.id}`);
+    socket.on('join_auction',  id => socket.join(id));
+    socket.on('leave_auction', id => socket.leave(id));
+    socket.on('disconnect', () => console.log(`Disconnected: ${socket.id}`));
+  });
+  return io;
+};
+export const getIO = () => {
+  if (!io) throw new Error('Socket.io not initialized!');
+  return io;
+};
+
+================================================================
+FILE: server/services/aiService.js
+================================================================
+import Groq from 'groq-sdk';
+export const generateAuctionDescription = async (title, keywords) => {
+  try {
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const prompt = `Write an engaging premium auction description for "${title}".
+Keywords: ${keywords}. Keep it under 150 words, appealing to bidders.`;
+    const res = await groq.chat.completions.create({
+      messages: [{ role:'user', content: prompt }],
+      model: 'llama-3.1-8b-instant',
+    });
+    return res.choices[0]?.message?.content || '';
+  } catch (e) { throw new Error('Failed to generate description'); }
+};
+
+================================================================
+FILE: server/routes/authRoute.js
+================================================================
+import express from 'express';
+import { registerUser, loginUser } from '../controllers/authController.js';
+const router = express.Router();
+router.post('/register', registerUser);
+router.post('/login',    loginUser);
+export default router;
+
+================================================================
+FILE: server/routes/auctionRoute.js
+================================================================
+import express from 'express';
+import { getAuctions,getAuctionById,createAuction,updateAuctionStatus,
+  deleteAuction,getAdminBidsByAuction,deleteBid,getAllUsers }
+  from '../controllers/auctionController.js';
+import { protect, admin } from '../middleware/authMiddleware.js';
+const router = express.Router();
+router.route('/').get(getAuctions).post(protect,admin,createAuction);
+router.route('/:id').get(getAuctionById).put(protect,admin,updateAuctionStatus)
+  .delete(protect,admin,deleteAuction);
+router.get('/:auctionId/bids', protect, admin, getAdminBidsByAuction);
+router.delete('/bids/:bidId',  protect, admin, deleteBid);
+router.get('/admin/users',     protect, admin, getAllUsers);
+export default router;
+
+================================================================
+FILE: server/routes/bidRoute.js  |  server/routes/aiRoute.js
+================================================================
+// bidRoute.js
+import express from 'express';
+import { createBid, getBidsByAuctionId } from '../controllers/bidController.js';
+import { protect } from '../middleware/authMiddleware.js';
+const router = express.Router();
+router.post('/',              protect, createBid);
+router.get('/:auctionId',    getBidsByAuctionId);
+export default router;
+
+// aiRoute.js
+import express from 'express';
+import { generateDescription } from '../controllers/aiController.js';
+import { protect, admin } from '../middleware/authMiddleware.js';
+const r = express.Router();
+r.post('/generate-description', protect, admin, generateDescription);
+export default r;
+
+================================================================
+FILE: client/src/main.jsx  |  client/index.html
+================================================================
+// main.jsx
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import './index.css';
+import App from './App.jsx';
+createRoot(document.getElementById('root')).render(<StrictMode><App/></StrictMode>);
+
+<!-- index.html -->
+<!doctype html><html lang="en"><head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>BidMaster – Online Auction Platform</title>
+</head><body><div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body></html>
+
+================================================================
+FILE: client/src/App.jsx
+================================================================
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { Toaster } from 'react-hot-toast';
+import { useAuthStore } from './store/useAuthStore';
+import Navbar from './components/Navbar';
+import Home from './pages/Home';
+import Login from './pages/Login';
+import Register from './pages/Register';
+import Dashboard from './pages/Dashboard';
+import AdminDashboard from './pages/AdminDashboard';
+import AuctionView from './pages/AuctionView';
+
+const ProtectedRoute = ({ children, requireAdmin=false }) => {
+  const { isAuthenticated, token, user } = useAuthStore();
+  if (!isAuthenticated && !token) return <Navigate to="/login" replace />;
+  if (requireAdmin && user?.role !== 'Admin') return <Navigate to="/" replace />;
+  return children;
+};
+export default function App() {
+  const rehydrate = useAuthStore(s => s.rehydrate);
+  React.useEffect(() => { rehydrate(); }, [rehydrate]);
+  return (
+    <Router>
+      <div className="min-h-screen flex flex-col font-sans">
+        <Navbar />
+        <main className="flex-grow">
+          <Routes>
+            <Route path="/"         element={<Home />} />
+            <Route path="/login"    element={<Login />} />
+            <Route path="/register" element={<Register />} />
+            <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
+            <Route path="/admin"     element={<ProtectedRoute requireAdmin><AdminDashboard /></ProtectedRoute>} />
+            <Route path="/auction/:id" element={<ProtectedRoute><AuctionView /></ProtectedRoute>} />
+          </Routes>
+        </main>
+        <Toaster position="bottom-right" />
+      </div>
+    </Router>
+  );
+}
+
+================================================================
+FILE: client/src/store/useAuthStore.js
+================================================================
+import { create } from 'zustand';
+import api from '../services/api';
+import toast from 'react-hot-toast';
+export const useAuthStore = create((set) => ({
+  user: null, token: localStorage.getItem('token')||null,
+  isAuthenticated: !!localStorage.getItem('token'), loading: false,
+  login: async (email, password) => {
+    set({ loading:true });
+    try {
+      const { data } = await api.post('/auth/login', { email, password });
+      localStorage.setItem('token', data.token);
+      set({ user:data, token:data.token, isAuthenticated:true, loading:false });
+      toast.success('Logged in!'); return true;
+    } catch (e) { set({loading:false}); toast.error(e.response?.data?.message||'Login failed'); return false; }
+  },
+  register: async (name, email, password) => {
+    set({ loading:true });
+    try {
+      const { data } = await api.post('/auth/register', { name, email, password });
+      localStorage.setItem('token', data.token);
+      set({ user:data, token:data.token, isAuthenticated:true, loading:false });
+      toast.success('Registered!'); return true;
+    } catch (e) { set({loading:false}); toast.error(e.response?.data?.message||'Failed'); return false; }
+  },
+  logout: () => { localStorage.removeItem('token'); set({user:null,token:null,isAuthenticated:false}); toast.success('Logged out'); },
+  rehydrate: () => {
+    const token = localStorage.getItem('token');
+    if (token) { try {
+      const p = JSON.parse(atob(token.split('.')[1]));
+      set({ user:{role:p.role}, isAuthenticated:true });
+    } catch { localStorage.removeItem('token'); set({isAuthenticated:false,user:null}); } }
+  }
+}));
+
+================================================================
+FILE: client/src/store/useAuctionStore.js
+================================================================
+import { create } from 'zustand';
+import api from '../services/api';
+export const useAuctionStore = create((set) => ({
+  auctions:[], auction:null, bids:[], loading:false,
+  fetchAuctions: async () => {
+    set({loading:true});
+    try { const {data}=await api.get('/auctions'); set({auctions:data,loading:false}); }
+    catch(e){ set({loading:false}); console.error(e); }
+  },
+  fetchAuctionById: async (id) => {
+    set({loading:true});
+    try { const {data}=await api.get(`/auctions/${id}`); set({auction:data,loading:false}); }
+    catch(e){ set({loading:false}); console.error(e); }
+  },
+  fetchBids: async (auctionId) => {
+    try { const {data}=await api.get(`/bids/${auctionId}`); set({bids:data}); }
+    catch(e){ console.error(e); }
+  },
+  addBid: (b) => set(s=>({ bids:[b,...s.bids] })),
+  updateAuctionCurrentBid: (amount) => set(s=>({
+    auction: s.auction ? {...s.auction, currentBid:amount} : null
+  })),
+}));
+
+================================================================
+FILE: client/src/services/api.js  |  socket.js
+================================================================
+// api.js
+import axios from 'axios';
+const api = axios.create({ baseURL: import.meta.env.VITE_API_BASE_URL||'http://localhost:5000/api' });
+api.interceptors.request.use(config => {
+  const t = localStorage.getItem('token');
+  if (t) config.headers.Authorization = `Bearer ${t}`;
+  return config;
+});
+export default api;
+
+// socket.js
+import { io } from 'socket.io-client';
+const URL = import.meta.env.VITE_API_BASE_URL
+  ? import.meta.env.VITE_API_BASE_URL.replace('/api','') : 'http://localhost:5000';
+export const socket = io(URL, { autoConnect: false });
+
+================================================================
+FILE: client/src/components/Navbar.jsx
+================================================================
+import React from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useAuthStore } from '../store/useAuthStore';
+import { Gavel, LogOut } from 'lucide-react';
+export default function Navbar() {
+  const { isAuthenticated, user, logout } = useAuthStore();
+  const navigate = useNavigate();
+  return (
+    <nav className="glass-card sticky top-0 z-50">
+      <div className="max-w-7xl mx-auto px-6 flex justify-between h-16 items-center">
+        <Link to="/" className="flex items-center gap-2">
+          <div className="bg-indigo-600 p-2 rounded-lg text-white"><Gavel size={22}/></div>
+          <span className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-600 to-purple-600">BidMaster</span>
+        </Link>
+        <div className="flex items-center gap-4">
+          {isAuthenticated ? (<>
+            <Link to="/dashboard" className="text-sm font-medium text-slate-700 hover:text-indigo-600 transition">Dashboard</Link>
+            {user?.role==='Admin' && <Link to="/admin" className="text-sm font-medium text-slate-700 hover:text-indigo-600 transition">Admin</Link>}
+            <button onClick={()=>{logout();navigate('/')}} className="flex items-center gap-2 text-sm text-slate-700 hover:text-red-600">
+              <LogOut size={18}/> Logout
+            </button>
+          </>) : (<>
+            <Link to="/login" className="text-sm font-medium text-slate-700 hover:text-indigo-600">Login</Link>
+            <Link to="/register" className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 shadow-lg">Register</Link>
+          </>)}
+        </div>
+      </div>
+    </nav>
+  );
+}
+
+================================================================
+FILE: client/src/components/AuctionCard.jsx
+================================================================
+import React from 'react';
+import { Link } from 'react-router-dom';
+import { motion } from 'framer-motion';
+import { Clock, IndianRupee } from 'lucide-react';
+import { formatDistanceToNow } from 'date-fns';
+export default function AuctionCard({ auction }) {
+  const isExpired = new Date(auction.endTime) < new Date();
+  return (
+    <motion.div initial={{opacity:0,y:20}} animate={{opacity:1,y:0}}
+      whileHover={{y:-5}} transition={{duration:0.3}}
+      className="glass-card rounded-2xl overflow-hidden flex flex-col h-full group">
+      <div className="h-48 overflow-hidden relative bg-slate-200">
+        <img src={auction.image||"https://images.unsplash.com/photo-1584882103328-769018cffea4?auto=format&fit=crop&q=80&w=600"}
+          alt={auction.title} className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"/>
+        <div className="absolute top-3 right-3 bg-white/90 backdrop-blur-sm px-3 py-1 rounded-full text-xs font-semibold shadow-sm flex items-center gap-1">
+          <Clock size={14} className={isExpired?"text-red-500":"text-green-500"}/>
+          {isExpired?"Ended":formatDistanceToNow(new Date(auction.endTime),{addSuffix:true})}
+        </div>
+      </div>
+      <div className="p-5 flex-grow flex flex-col">
+        <h3 className="text-lg font-bold text-slate-900 mb-2 line-clamp-1">{auction.title}</h3>
+        <p className="text-sm text-slate-500 line-clamp-2 mb-4 flex-grow">{auction.description}</p>
+        <div className="flex justify-between items-end mt-4 pt-4 border-t border-slate-100">
+          <div>
+            <p className="text-xs text-slate-400 uppercase tracking-wider font-semibold">Current Bid</p>
+            <p className="text-xl font-bold text-indigo-600 flex items-center"><IndianRupee size={20}/>{auction.currentBid}</p>
+          </div>
+          <Link to={`/auction/${auction._id}`}
+            className="px-4 py-2 bg-slate-900 text-white text-sm font-medium rounded-lg hover:bg-indigo-600 transition-colors">
+            {isExpired?"View Details":"Place Bid"}
+          </Link>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+================================================================
+FILE: client/src/pages/AuctionView.jsx  (key logic)
+================================================================
+import React,{useEffect,useState} from 'react';
+import {useParams} from 'react-router-dom';
+import {motion} from 'framer-motion';
+import {socket} from '../services/socket';
+import {useAuctionStore} from '../store/useAuctionStore';
+import {useAuthStore} from '../store/useAuthStore';
+import {formatDistanceToNow} from 'date-fns';
+import {IndianRupee,Clock,TrendingUp,Trophy} from 'lucide-react';
+import toast from 'react-hot-toast';
+
+export default function AuctionView() {
+  const {id}=useParams(); const {user}=useAuthStore();
+  const {auction,bids,loading,fetchAuctionById,fetchBids,addBid,updateAuctionCurrentBid}=useAuctionStore();
+  const [bidAmount,setBidAmount]=useState('');
+  const [timeLeft,setTimeLeft]=useState('');
+
+  useEffect(()=>{
+    fetchAuctionById(id); fetchBids(id);
+    socket.connect(); socket.emit('join_auction',id);
+    socket.on('new_bid',data=>{
+      if(data.auctionId===id){
+        addBid(data.bid); updateAuctionCurrentBid(data.currentBid);
+        toast.success(`New bid: Rs.${data.currentBid} by ${data.bid.user.name}`,{icon:'rocket'});
+      }
+    });
+    return ()=>{ socket.emit('leave_auction',id); socket.off('new_bid'); socket.disconnect(); };
+  },[id]);
+
+  useEffect(()=>{
+    if(!auction) return;
+    const iv=setInterval(()=>{
+      const diff=new Date(auction.endTime)-new Date();
+      if(diff<=0){setTimeLeft('Auction Ended');clearInterval(iv);}
+      else{
+        const d=Math.floor(diff/86400000),h=Math.floor(diff/3600000%24),
+              m=Math.floor(diff/60000%60),s=Math.floor(diff/1000%60);
+        setTimeLeft(`${d}d ${h}h ${m}m ${s}s`);
+      }
+    },1000);
+    return ()=>clearInterval(iv);
+  },[auction]);
+
+  const handlePlaceBid=async e=>{
+    e.preventDefault();
+    const amount=Number(bidAmount);
+    if(!amount||amount<=auction.currentBid) return toast.error('Bid must exceed current bid');
+    try{
+      const {default:api}=await import('../services/api');
+      await api.post('/bids',{auctionId:id,amount});
+      setBidAmount('');
+    }catch(err){toast.error(err.response?.data?.message||'Error placing bid');}
+  };
+
+  if(loading||!auction) return <div className="min-h-[60vh] flex items-center justify-center animate-pulse text-xl text-indigo-600">Loading...</div>;
+  const isEnded=new Date(auction.endTime)<new Date();
+  const highestBidder=bids.length>0?bids[0].user:null;
+  const isWinner=isEnded&&highestBidder?._id===user?._id;
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 py-12">
+      {isWinner&&<motion.div initial={{opacity:0,scale:0.9}} animate={{opacity:1,scale:1}}
+        className="bg-yellow-100 border border-yellow-300 text-yellow-800 px-6 py-4 rounded-xl mb-8 flex items-center gap-3">
+        <Trophy size={24} className="text-yellow-600"/><strong>Congratulations! You won this auction!</strong>
+      </motion.div>}
+      {/* Two-column layout: image+details on left, bid panel+history on right */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-12">
+        <div>
+          <div className="glass-card rounded-3xl overflow-hidden mb-6 relative">
+            {isEnded&&<div className="absolute inset-0 bg-black/40 z-10 flex items-center justify-center">
+              <span className="bg-red-600 text-white px-6 py-2 rounded-full font-bold uppercase tracking-widest">Auction Closed</span>
+            </div>}
+            <img src={auction.image||"https://images.unsplash.com/..."} alt={auction.title}
+              className="w-full h-96 object-cover"/>
+          </div>
+          <h1 className="text-4xl font-extrabold text-slate-900 mb-4">{auction.title}</h1>
+          <p className="text-lg text-slate-600 mb-6">{auction.description}</p>
+          <div className="grid grid-cols-2 gap-6 bg-slate-50 p-6 rounded-2xl border border-slate-100">
+            <div><p className="text-xs font-semibold text-slate-400 uppercase">Starting Price</p>
+              <p className="text-2xl font-bold">Rs.{auction.startingPrice}</p></div>
+            <div><p className="text-xs font-semibold text-slate-400 uppercase">Total Bids</p>
+              <p className="text-2xl font-bold flex items-center gap-2"><TrendingUp size={20} className="text-indigo-500"/>{bids.length}</p></div>
+          </div>
+        </div>
+        <div className="flex flex-col">
+          <div className="glass-card p-8 rounded-3xl shadow-xl mb-8 sticky top-24">
+            <div className="flex justify-between items-end mb-8 border-b border-slate-200 pb-6">
+              <div>
+                <p className="text-sm font-bold text-slate-500 uppercase tracking-widest mb-2">Current Highest Bid</p>
+                <motion.div key={auction.currentBid} initial={{scale:1.1,color:'#4f46e5'}} animate={{scale:1,color:'#0f172a'}}
+                  className="text-5xl font-black flex items-center">
+                  <IndianRupee size={40} className="text-indigo-600"/>{auction.currentBid}
+                </motion.div>
+                {highestBidder&&!isEnded&&<p className="text-sm text-slate-500 mt-2">by <span className="font-semibold">{highestBidder.name}</span></p>}
+              </div>
+              <div className="text-right">
+                <p className="text-sm font-bold text-slate-500 uppercase tracking-widest mb-2">Time Remaining</p>
+                <div className={`text-xl font-bold flex items-center gap-2 ${isEnded?'text-red-500':'text-slate-800'}`}>
+                  <Clock size={20}/>{timeLeft}
+                </div>
+              </div>
+            </div>
+            {!isEnded?(
+              <form onSubmit={handlePlaceBid} className="space-y-4">
+                <div className="relative">
+                  <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none"><IndianRupee size={24} className="text-slate-400"/></div>
+                  <input type="number" min={auction.currentBid+1} value={bidAmount}
+                    onChange={e=>setBidAmount(e.target.value)}
+                    placeholder={`Min. bid: Rs.${auction.currentBid+1}`}
+                    className="w-full pl-12 pr-4 py-4 text-xl border-2 border-slate-200 rounded-xl focus:border-indigo-500 font-semibold bg-slate-50"/>
+                </div>
+                <button type="submit" disabled={!bidAmount||Number(bidAmount)<=auction.currentBid}
+                  className="w-full py-4 text-lg font-bold text-white bg-slate-900 rounded-xl hover:bg-indigo-600 disabled:opacity-50 transition-all">
+                  Place Bid Now
+                </button>
+              </form>
+            ):<div className="bg-slate-100 p-4 rounded-xl text-center"><p className="font-bold text-slate-600">Bidding has concluded.</p></div>}
+          </div>
+          <div>
+            <h3 className="text-xl font-bold text-slate-900 mb-4 flex items-center gap-2">
+              <TrendingUp size={24} className="text-indigo-600"/>Live Bid History
+            </h3>
+            <div className="glass-card rounded-2xl overflow-hidden max-h-[300px] overflow-y-auto">
+              {bids.length>0?(
+                <ul className="divide-y divide-slate-100">{bids.map((bid,i)=>(
+                  <motion.li key={bid._id} initial={{opacity:0,x:-20}} animate={{opacity:1,x:0}} transition={{delay:i*0.05}}
+                    className={`p-4 flex justify-between items-center hover:bg-slate-50/50 transition-colors ${i===0?'bg-indigo-50/50':''}`}>
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-full bg-indigo-100 text-indigo-700 font-bold flex items-center justify-center">
+                        {bid.user.name.charAt(0)}
+                      </div>
+                      <div>
+                        <p className={`font-semibold ${i===0?'text-indigo-900':'text-slate-800'}`}>{bid.user.name}</p>
+                        <p className="text-xs text-slate-500">{formatDistanceToNow(new Date(bid.createdAt),{addSuffix:true})}</p>
+                      </div>
+                    </div>
+                    <div className={`text-lg font-bold flex items-center gap-1 ${i===0?'text-indigo-600':'text-slate-700'}`}>
+                      <IndianRupee size={16}/>{bid.amount}
+                    </div>
+                  </motion.li>
+                ))}</ul>
+              ):<div className="p-8 text-center text-slate-500 italic">No bids placed yet. Be the first!</div>}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+================================================================
+FILE: client/src/index.css
+================================================================
+@import "tailwindcss";
+@layer base { body { @apply bg-slate-50 text-slate-900; } }
+.glass-card { @apply bg-white/70 backdrop-blur-md border border-white/20 shadow-xl; }
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+================================================================
+FILE: server/package.json
+================================================================
+{
+  "name": "bidding-server", "version": "1.0.0", "type": "module",
+  "scripts": { "start": "node server.js", "dev": "nodemon server.js" },
+  "dependencies": {
+    "bcrypt":"^5.1.1", "cors":"^2.8.5", "dotenv":"^16.6.1",
+    "express":"^4.18.2", "express-rate-limit":"^7.1.5",
+    "groq-sdk":"^0.3.0", "helmet":"^7.1.0", "jsonwebtoken":"^9.0.2",
+    "mongoose":"^8.0.3", "morgan":"^1.10.0", "socket.io":"^4.7.2"
+  },
+  "devDependencies": { "nodemon": "^3.0.2" }
+}
+
+================================================================
+FILE: client/package.json
+================================================================
+{
+  "name": "client", "private": true, "version": "0.0.0", "type": "module",
+  "scripts": { "dev":"vite", "build":"vite build", "preview":"vite preview" },
+  "dependencies": {
+    "axios":"^1.13.6", "date-fns":"^4.1.0", "framer-motion":"^12.36.0",
+    "lucide-react":"^0.577.0", "react":"^19.2.4", "react-dom":"^19.2.4",
+    "react-hot-toast":"^2.6.0", "react-router-dom":"^7.13.1",
+    "socket.io-client":"^4.8.3", "zustand":"^5.0.11"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react":"^6.0.0", "tailwindcss":"^4.2.1", "vite":"^8.0.0"
+  }
+}
+
+================================================================
+FILE: docker-compose.yml
+================================================================
+version: "3.8"
+services:
+  server:
+    build: { context: ./server, dockerfile: Dockerfile }
+    ports: ["5000:5000"]
+    environment: [NODE_ENV=production, PORT=5000]
+    env_file: [./server/.env]
+    restart: always
+  client:
+    build: { context: ./client, dockerfile: Dockerfile }
+    ports: ["80:80"]
+    depends_on: [server]
+    restart: always
+
+================================================================
+END OF SOURCE CODE DOCUMENTATION
+Total Files Covered: 26 source files
+Lines of Code (approx): 700
+================================================================
