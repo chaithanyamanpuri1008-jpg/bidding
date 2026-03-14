@@ -1,0 +1,4 @@
+server/
+Dockerfile
+docker-compose.yml
+SOURCE_CODE_DOCUMENTATION.txt
